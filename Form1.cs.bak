@@ -1,0 +1,422 @@
+﻿using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Drawing;
+using System.Linq;
+using System.Text;
+using System.Windows.Forms;
+using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
+using System.IO;
+using System.Collections.Concurrent;
+
+namespace Suntech_Alert
+{
+    public partial class Form1 : Form
+    {
+        private TcpClient redisClient;
+        private NetworkStream redisStream;
+        private string redisServer = "localhost";
+        private int redisPort = 6379;
+        private string channel = "sqlserver:metrics";
+        private bool isConnected = false;
+        private Task listenTask;
+        private CancellationTokenSource tokenSource;
+        
+        // Cache for metrics data
+        private readonly ConcurrentDictionary<string, Dictionary<string, object>> metricsCache = 
+            new ConcurrentDictionary<string, Dictionary<string, object>>();
+        
+        // This will hold our metrics for DataGridView
+        private readonly DataTable metricsTable = new DataTable();
+
+        public Form1()
+        {
+            InitializeComponent();
+            InitializeMetricsTable();
+        }
+
+        private void InitializeMetricsTable()
+        {
+            metricsTable.Columns.Add("Metric Type", typeof(string));
+            metricsTable.Columns.Add("Name", typeof(string));
+            metricsTable.Columns.Add("Value", typeof(string));
+            metricsTable.Columns.Add("Extra Info", typeof(string));
+            metricsTable.Columns.Add("Last Updated", typeof(DateTime));
+            
+            dgvMetrics.DataSource = metricsTable;
+        }
+
+        private void btnConnect_Click(object sender, EventArgs e)
+        {
+            if (!isConnected)
+            {
+                Connect();
+            }
+            else
+            {
+                Disconnect();
+            }
+        }
+        
+        private void Connect()
+        {
+            try
+            {
+                // Parse server and port
+                string server = txtRedisServer.Text.Trim();
+                string[] parts = server.Split(':');
+                redisServer = parts[0];
+                redisPort = parts.Length > 1 ? Convert.ToInt32(parts[1]) : 6379;
+                channel = txtChannel.Text.Trim();
+                
+                // Connect to Redis
+                redisClient = new TcpClient(redisServer, redisPort);
+                redisStream = redisClient.GetStream();
+                
+                // Set up cancellation token
+                tokenSource = new CancellationTokenSource();
+                
+                // Start listening for messages
+                listenTask = Task.Factory.StartNew(() => ListenForMessages(tokenSource.Token), 
+                    tokenSource.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+                
+                // Subscribe to channel
+                SubscribeToChannel(channel);
+                
+                // Update UI
+                isConnected = true;
+                btnConnect.Text = "Disconnect";
+                lblStatus.Text = "Connected";
+                lblStatus.ForeColor = Color.Green;
+                
+                LogMessage($"Connected to {redisServer}:{redisPort} and subscribed to {channel}");
+                timer1.Start();
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Error connecting: {ex.Message}");
+                Disconnect();
+            }
+        }
+        
+        private void Disconnect()
+        {
+            try
+            {
+                isConnected = false;
+                btnConnect.Text = "Connect";
+                lblStatus.Text = "Not Connected";
+                lblStatus.ForeColor = Color.Black;
+                timer1.Stop();
+                
+                // Cancel the listening task
+                if (tokenSource != null)
+                {
+                    tokenSource.Cancel();
+                }
+                
+                // Cleanup resources
+                if (redisStream != null)
+                {
+                    redisStream.Close();
+                    redisStream = null;
+                }
+                
+                if (redisClient != null)
+                {
+                    redisClient.Close();
+                    redisClient = null;
+                }
+                
+                LogMessage("Disconnected from Redis");
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Error disconnecting: {ex.Message}");
+            }
+        }
+        
+        private void SubscribeToChannel(string channelName)
+        {
+            if (redisStream != null)
+            {
+                string subscribeCommand = $"SUBSCRIBE {channelName}\r\n";
+                byte[] commandBytes = Encoding.ASCII.GetBytes(subscribeCommand);
+                redisStream.Write(commandBytes, 0, commandBytes.Length);
+                redisStream.Flush();
+            }
+        }
+        
+        private void ListenForMessages(CancellationToken token)
+        {
+            try
+            {
+                byte[] buffer = new byte[4096];
+                int bytesRead;
+                
+                while (!token.IsCancellationRequested && redisClient.Connected)
+                {
+                    StringBuilder messageBuilder = new StringBuilder();
+                    
+                    // Read available data
+                    while (redisStream.DataAvailable && !token.IsCancellationRequested)
+                    {
+                        bytesRead = redisStream.Read(buffer, 0, buffer.Length);
+                        if (bytesRead > 0)
+                        {
+                            messageBuilder.Append(Encoding.UTF8.GetString(buffer, 0, bytesRead));
+                        }
+                    }
+                    
+                    string data = messageBuilder.ToString();
+                    if (!string.IsNullOrEmpty(data))
+                    {
+                        // Process the Redis protocol message
+                        BeginInvoke(new Action(() => ProcessRedisMessage(data)));
+                    }
+                    
+                    // Small delay to prevent CPU thrashing
+                    Thread.Sleep(10);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!token.IsCancellationRequested)
+                {
+                    BeginInvoke(new Action(() => LogMessage($"Error in listener: {ex.Message}")));
+                }
+            }
+        }
+        
+        private void ProcessRedisMessage(string data)
+        {
+            try
+            {
+                // Simple parsing of Redis protocol
+                string[] lines = data.Split(new[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries);
+                
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    // Look for the message pattern
+                    if (lines[i] == "message" && i + 2 < lines.Length)
+                    {
+                        string channel = lines[i + 1];
+                        string message = lines[i + 2];
+                        ProcessMessage(channel, message);
+                        i += 2; // Skip the channel and message we just processed
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Error processing Redis protocol: {ex.Message}");
+            }
+        }
+        
+        private void ProcessMessage(string channel, string message)
+        {
+            try
+            {
+                LogMessage($"Received message on channel: {channel}");
+                
+                // Basic parsing of the JSON message
+                if (message.Contains("collected_at") && message.Contains("metrics"))
+                {
+                    // Extract basic information by parsing the JSON manually
+                    string collectedAt = ExtractJsonValue(message, "collected_at");
+                    string source = ExtractJsonValue(message, "source");
+                    string metricsType = ExtractJsonValue(message, "metrics_type");
+                    
+                    // Try to parse count, default to 0 if we can't
+                    int count = 0;
+                    string countStr = ExtractJsonValue(message, "count");
+                    if (!string.IsNullOrEmpty(countStr))
+                    {
+                        int.TryParse(countStr, out count);
+                    }
+                    
+                    LogMessage($"Received {count} {metricsType} metrics from {source} at {collectedAt}");
+                    
+                    // Process each metric based on its type
+                    ExtractMetrics(message, metricsType);
+                }
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Error processing message: {ex.Message}");
+            }
+        }
+        
+        private string ExtractJsonValue(string json, string key)
+        {
+            string pattern = "\"" + key + "\"\\s*:\\s*\"?([^\",}]*)\"?";
+            System.Text.RegularExpressions.Match match = 
+                System.Text.RegularExpressions.Regex.Match(json, pattern);
+            
+            return match.Success ? match.Groups[1].Value : string.Empty;
+        }
+        
+        private void ExtractMetrics(string json, string metricsType)
+        {
+            try
+            {
+                // Find the metrics array part in the JSON
+                int metricsStart = json.IndexOf("\"metrics\":");
+                if (metricsStart > 0)
+                {
+                    // Extract the metrics array
+                    int arrayStart = json.IndexOf('[', metricsStart);
+                    int arrayEnd = json.LastIndexOf(']');
+                    
+                    if (arrayStart > 0 && arrayEnd > arrayStart)
+                    {
+                        string metricsArray = json.Substring(arrayStart, arrayEnd - arrayStart + 1);
+                        
+                        // Split the array into individual objects
+                        int objStart = 0;
+                        int nestLevel = 0;
+                        List<string> metricObjects = new List<string>();
+                        
+                        for (int i = 0; i < metricsArray.Length; i++)
+                        {
+                            if (metricsArray[i] == '{')
+                            {
+                                if (nestLevel == 0)
+                                {
+                                    objStart = i;
+                                }
+                                nestLevel++;
+                            }
+                            else if (metricsArray[i] == '}')
+                            {
+                                nestLevel--;
+                                if (nestLevel == 0)
+                                {
+                                    string metricObj = metricsArray.Substring(objStart, i - objStart + 1);
+                                    metricObjects.Add(metricObj);
+                                }
+                            }
+                        }
+                        
+                        // Process each metric object
+                        foreach (string metricObj in metricObjects)
+                        {
+                            ProcessMetricObject(metricObj, metricsType);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Error extracting metrics: {ex.Message}");
+            }
+        }
+        
+        private void ProcessMetricObject(string metricJson, string metricsType)
+        {
+            try
+            {
+                string key = string.Empty;
+                string name = string.Empty;
+                string value = string.Empty;
+                string extraInfo = string.Empty;
+                
+                if (metricsType == "database_metrics")
+                {
+                    string database = ExtractJsonValue(metricJson, "database");
+                    string cpuUsage = ExtractJsonValue(metricJson, "cpu_usage_percent");
+                    string totalIo = ExtractJsonValue(metricJson, "total_io");
+                    
+                    name = database;
+                    value = $"CPU: {cpuUsage}%, IO: {totalIo}";
+                    key = $"database_{name}";
+                }
+                else if (metricsType == "wait_stats_metrics")
+                {
+                    string metricType = ExtractJsonValue(metricJson, "metric_type");
+                    string subMetric = ExtractJsonValue(metricJson, "sub_metric");
+                    string metricValue = ExtractJsonValue(metricJson, "value");
+                    extraInfo = ExtractJsonValue(metricJson, "extra_info");
+                    
+                    name = $"{metricType} - {subMetric}";
+                    value = metricValue;
+                    key = $"waitstat_{metricType}_{subMetric}";
+                }
+                else
+                {
+                    // Generic handling for other metric types
+                    name = ExtractJsonValue(metricJson, "name");
+                    if (string.IsNullOrEmpty(name)) name = "Unknown";
+                    
+                    value = ExtractJsonValue(metricJson, "value");
+                    if (string.IsNullOrEmpty(value)) value = "N/A";
+                    
+                    key = $"other_{name}";
+                }
+                
+                if (!string.IsNullOrEmpty(name))
+                {
+                    // Store in our cache
+                    var metricData = new Dictionary<string, object>
+                    {
+                        { "MetricType", metricsType },
+                        { "Name", name },
+                        { "Value", value },
+                        { "ExtraInfo", extraInfo },
+                        { "LastUpdated", DateTime.Now }
+                    };
+                    
+                    metricsCache[key] = metricData;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Error processing metric object: {ex.Message}");
+            }
+        }
+        
+        private void timer1_Tick(object sender, EventArgs e)
+        {
+            try
+            {
+                RefreshMetricsGrid();
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Error refreshing metrics: {ex.Message}");
+            }
+        }
+        
+        private void RefreshMetricsGrid()
+        {
+            metricsTable.Clear();
+            
+            foreach (var metric in metricsCache.Values)
+            {
+                DataRow row = metricsTable.NewRow();
+                row["Metric Type"] = metric["MetricType"];
+                row["Name"] = metric["Name"];
+                row["Value"] = metric["Value"];
+                row["Extra Info"] = metric["ExtraInfo"];
+                row["Last Updated"] = metric["LastUpdated"];
+                metricsTable.Rows.Add(row);
+            }
+        }
+        
+        private void LogMessage(string message)
+        {
+            if (rtbMessages.InvokeRequired)
+            {
+                BeginInvoke(new Action(() => LogMessage(message)));
+                return;
+            }
+            
+            string timeStamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
+            rtbMessages.AppendText($"[{timeStamp}] {message}\n");
+            rtbMessages.ScrollToCaret();
+        }
+    }
+}
