@@ -31,7 +31,7 @@ Suntech Alert is a .NET Windows Forms application designed to monitor SQL Server
 
 ## Installation
 
-1. Clone the repository:git clone https://github.com/yourusername/suntech-alert.git2. Open the `Suntech Alert.sln` solution file in Visual Studio.
+1. Clone the repository:git clone https://github.com/tulipmotionpicture/suntech-alert.git. Open the `Suntech Alert.sln` solution file in Visual Studio.
 3. Restore NuGet packages:nuget restore "Suntech Alert.sln"4. Build the solution:msbuild "Suntech Alert.sln" /p:Configuration=Release5. Run the application by executing the generated `Suntech Alert.exe` file.
 
 ## Usage
